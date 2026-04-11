@@ -304,10 +304,25 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 	return nil
 }
 
-// Append the given entries to the raft log and update ps.raftState also delete log entries that will
-// never be committed
+// Append 将给定的日志条目追加到 raft log，更新 ps.raftState，并删除不会再提交的旧日志条目
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+	for _, entry := range entries {
+		key := meta.RaftLogKey(ps.region.Id, entry.Index)
+		raftWB.SetMeta(key, &entry)
+	}
+	lastIndex := entries[len(entries)-1].Index
+	lastTerm := entries[len(entries)-1].Term
+	// 删除不会再提交的旧日志条目（新 leader 覆盖了未提交的旧日志）
+	for i := lastIndex + 1; i <= ps.raftState.LastIndex; i++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+	}
+	// 更新 LastIndex 和 LastTerm
+	ps.raftState.LastIndex = lastIndex
+	ps.raftState.LastTerm = lastTerm
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 	return nil
 }
 
@@ -326,12 +341,36 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	return nil, nil
 }
 
-// Save memory states to disk.
-// Do not modify ready in this function, this is a requirement to advance the ready object properly later.
+// SaveReadyState 将内存状态持久化到磁盘。
+// 不要修改 ready，因为后续 Advance 需要用到原始 Ready 数据。
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
-	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// Your Code Here (2B/2C).
-	return nil, nil
+	raftWB := new(engine_util.WriteBatch)
+	kvWB := new(engine_util.WriteBatch)
+
+	// 快照
+	var result *ApplySnapResult
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		var err error
+		result, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 追加日志条目
+	if err := ps.Append(ready.Entries, raftWB); err != nil {
+		return nil, err
+	}
+
+	if !raft.IsEmptyHardState(ready.HardState) {
+		hs := ready.HardState
+		ps.raftState.HardState = &hs
+		raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	}
+
+	raftWB.WriteToDB(ps.Engines.Raft)
+	kvWB.WriteToDB(ps.Engines.Kv)
+	return result, nil
 }
 
 func (ps *PeerStorage) ClearData() {

@@ -46,6 +46,7 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 			msgs = append(msgs, <-rw.raftCh)
 		}
 		peerStateMap := make(map[uint64]*peerState)
+		// HandleMsg 表示应用到内存中的状态，HandleRaftReady 表示持久化并且 Advance。
 		for _, msg := range msgs {
 			peerState := rw.getPeerState(peerStateMap, msg.RegionID)
 			if peerState == nil {
