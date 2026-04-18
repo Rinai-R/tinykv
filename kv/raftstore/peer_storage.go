@@ -334,11 +334,56 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		return nil, err
 	}
 
-	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
-	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
-	// and ps.clearExtraData to delete stale data
-	// Your Code Here (2C).
-	return nil, nil
+	// 先保留 PrevRegion，再切换到新 region
+	prevRegion := ps.region
+	newRegion := snapData.GetRegion()
+
+	// 清理旧 region 的元数据和数据
+	if err := ps.clearMeta(kvWB, raftWB); err != nil {
+		return nil, err
+	}
+	ps.clearExtraData(newRegion)
+
+	// 更新内存中的 region
+	ps.region = newRegion
+
+	ps.applyState.AppliedIndex = snapshot.Metadata.Index
+	ps.applyState.TruncatedState = &rspb.RaftTruncatedState{
+		Index: snapshot.Metadata.Index,
+		Term:  snapshot.Metadata.Term,
+	}
+	kvWB.SetMeta(meta.ApplyStateKey(newRegion.Id), ps.applyState)
+
+	ps.raftState.LastIndex = snapshot.Metadata.Index
+	ps.raftState.LastTerm = snapshot.Metadata.Term
+	raftWB.SetMeta(meta.RaftStateKey(newRegion.Id), ps.raftState)
+
+	// 写入 RegionLocalState，状态为 Normal
+	meta.WriteRegionState(kvWB, newRegion, rspb.PeerState_Normal)
+
+	// 进入 Applying 状态，并向 region worker 调度 RegionTaskApply
+	ps.snapState = snap.SnapState{
+		StateType: snap.SnapState_Applying,
+	}
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: newRegion.Id,
+		Notifier: ch,
+		SnapMeta: snapshot.Metadata,
+		StartKey: prevRegion.GetStartKey(),
+		EndKey:   prevRegion.GetEndKey(),
+	}
+	// 等待 region worker 应用快照完成
+	if ok := <-ch; !ok {
+		return nil, errors.New("failed to apply snapshot")
+	}
+	ps.snapState.StateType = snap.SnapState_Relax
+
+	log.Infof("%v applied snapshot successfully", ps.Tag)
+	return &ApplySnapResult{
+		PrevRegion: prevRegion,
+		Region:     newRegion,
+	}, nil
 }
 
 // SaveReadyState 将内存状态持久化到磁盘。

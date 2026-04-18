@@ -236,7 +236,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := pr.Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	if err != nil {
-		return false
+		return r.sendSnapshot(to)
 	}
 	var entries []*pb.Entry
 	if len(r.RaftLog.entries) > 0 {
@@ -258,6 +258,21 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Entries: entries,
 		Commit:  r.RaftLog.committed,
 	})
+	return true
+}
+
+func (r *Raft) sendSnapshot(to uint64) bool {
+	snap, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		return false
+	}
+	r.send(pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snap,
+	})
+	r.Prs[to].Next = snap.Metadata.Index + 1
 	return true
 }
 
@@ -547,6 +562,18 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.electionElapsed = 0
 	r.resetRandomizedElectionTimeout()
 
+	// prevLogIndex 落在 committed 之前，
+	// 直接回 committed，让 leader 把 Next 推进到 committed+1
+	if m.Index < r.RaftLog.committed {
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			Term:    r.Term,
+			Index:   r.RaftLog.committed,
+		})
+		return
+	}
+
 	lastIndex := r.RaftLog.LastIndex()
 
 	// 检查 prevLogIndex 位置的日志是否匹配
@@ -583,9 +610,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			if existTerm == ent.Term {
 				continue
 			}
-			// 冲突：截断并追加剩余
-			offset := ent.Index - r.RaftLog.entries[0].Index
-			r.RaftLog.entries = r.RaftLog.entries[:offset]
+			// 冲突：截断并追加，越界保护
+			if len(r.RaftLog.entries) > 0 && ent.Index >= r.RaftLog.entries[0].Index {
+				offset := ent.Index - r.RaftLog.entries[0].Index
+				r.RaftLog.entries = r.RaftLog.entries[:offset]
+			}
 			if r.RaftLog.stabled >= ent.Index {
 				r.RaftLog.stabled = ent.Index - 1
 			}
@@ -646,7 +675,6 @@ func (r *Raft) maybeCommit() {
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
-
 	if m.Term < r.Term {
 		r.send(pb.Message{
 			MsgType: pb.MessageType_MsgHeartbeatResponse,
@@ -679,6 +707,54 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	metadata := m.Snapshot.Metadata
+
+	if m.Term < r.Term {
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			Term:    r.Term,
+			Reject:  true,
+			Index:   r.RaftLog.LastIndex() + 1,
+		})
+		return
+	}
+
+	// 如果快照已经过时，拒绝
+	if metadata.Index <= r.RaftLog.committed {
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			Term:    r.Term,
+			Reject:  false,
+			Index:   r.RaftLog.committed,
+		})
+		return
+	}
+
+	r.Lead = m.From
+	r.electionElapsed = 0
+	r.resetRandomizedElectionTimeout()
+
+	r.RaftLog.entries = nil
+	r.RaftLog.committed = metadata.Index
+	r.RaftLog.applied = metadata.Index
+	r.RaftLog.stabled = metadata.Index
+	r.RaftLog.pendingSnapshot = m.Snapshot
+
+	// 根据 ConfState 重建成员视图
+	r.Prs = make(map[uint64]*Progress)
+	for _, id := range metadata.ConfState.Nodes {
+		r.Prs[id] = &Progress{}
+	}
+
+	r.send(pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		Term:    r.Term,
+		Reject:  false,
+		Index:   metadata.Index,
+	})
 }
 
 // addNode add a new node to raft group

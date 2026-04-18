@@ -59,7 +59,17 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 
 	if result != nil {
-		// todo
+		// 快照被应用后，region 边界/成员可能已经改变，
+		// 需要同步更新 storeMeta 里的 region 索引
+		if !util.RegionEqual(result.PrevRegion, result.Region) {
+			d.peer.SetRegion(result.Region)
+			storeMeta := d.ctx.storeMeta
+			storeMeta.Lock()
+			storeMeta.regions[result.Region.Id] = result.Region
+			storeMeta.regionRanges.Delete(&regionItem{region: result.PrevRegion})
+			storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: result.Region})
+			storeMeta.Unlock()
+		}
 	}
 
 	// 发送 Raft 消息给其他 peer
